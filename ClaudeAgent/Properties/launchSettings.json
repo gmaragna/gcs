@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "ClaudeAgent": {
+      "commandName": "Project",
+      "environmentVariables": {
+        "ANTHROPIC_API_KEY": "REPLACE_WITH_YOUR_KEY"
+      }
+    }
+  }
+}

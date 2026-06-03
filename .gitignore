@@ -4,3 +4,6 @@ obj/
 *.suo
 .vs/
 *.DotSettings.user
+
+# Local secrets — never commit a real API key
+ClaudeAgent/Properties/launchSettings.local.json
