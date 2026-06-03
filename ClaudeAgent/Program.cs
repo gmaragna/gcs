@@ -1,5 +1,7 @@
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
 using System.Text.Json;
-using Anthropic;
+using System.Text.Json.Nodes;
 
 var apiKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY");
 if (string.IsNullOrWhiteSpace(apiKey))
@@ -12,38 +14,48 @@ if (string.IsNullOrWhiteSpace(apiKey))
     return 1;
 }
 
-using var api = new AnthropicApi(apiKey);
+const string Model = "claude-haiku-4-5-20251001";
+const string SystemPrompt =
+    "You are a helpful assistant. Use the available tools when the user asks about " +
+    "weather or math. Be concise in your answers.";
 
-var tools = new List<Tool>
+using var http = new HttpClient { BaseAddress = new Uri("https://api.anthropic.com/") };
+http.DefaultRequestHeaders.Add("x-api-key", apiKey);
+http.DefaultRequestHeaders.Add("anthropic-version", "2023-06-01");
+
+var tools = new JsonArray
 {
-    CreateTool("get_weather",
-        "Get the current weather for a given city.",
-        new
+    Tool("get_weather", "Get the current weather for a given city.",
+        new JsonObject
         {
-            type = "object",
-            properties = new
+            ["type"] = "object",
+            ["properties"] = new JsonObject
             {
-                location = new { type = "string", description = "City and country, e.g. 'Rome, Italy'" },
+                ["location"] = new JsonObject
+                {
+                    ["type"] = "string",
+                    ["description"] = "City and country, e.g. 'Rome, Italy'",
+                },
             },
-            required = new[] { "location" },
+            ["required"] = new JsonArray { "location" },
         }),
-    CreateTool("calculate",
-        "Evaluate a mathematical expression and return the numeric result.",
-        new
+    Tool("calculate", "Evaluate a mathematical expression and return the numeric result.",
+        new JsonObject
         {
-            type = "object",
-            properties = new
+            ["type"] = "object",
+            ["properties"] = new JsonObject
             {
-                expression = new { type = "string", description = "A math expression, e.g. '2 + 2' or '(3.14 * 10^2)'" },
+                ["expression"] = new JsonObject
+                {
+                    ["type"] = "string",
+                    ["description"] = "A math expression, e.g. '2 + 2' or '(3.14 * 10 * 10)'",
+                },
             },
-            required = new[] { "expression" },
+            ["required"] = new JsonArray { "expression" },
         }),
 };
 
-var messages = new List<Message>();
-var systemPrompt =
-    "You are a helpful assistant. Use the available tools when the user asks about " +
-    "weather or math. Be concise in your answers.";
+var messages = new JsonArray();
 
 Console.WriteLine("Claude Agent (C#) — type 'exit' to quit.");
 Console.WriteLine("Available tools: get_weather, calculate");
@@ -56,58 +68,55 @@ while (true)
     if (string.IsNullOrWhiteSpace(input) || input.Equals("exit", StringComparison.OrdinalIgnoreCase))
         break;
 
-    messages.Add(input.AsUserMessage());
+    messages.Add(new JsonObject { ["role"] = "user", ["content"] = input });
 
-    Message response;
-    try
-    {
-        response = await SendMessage(messages, systemPrompt, tools);
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"\n[API error] {ExtractApiError(ex)}");
-        messages.RemoveAt(messages.Count - 1);
-        continue;
-    }
+    var response = await SendAsync();
+    if (response is null) { messages.RemoveAt(messages.Count - 1); continue; }
 
-    while (response.StopReason == StopReason.ToolUse)
+    while (response["stop_reason"]?.GetValue<string>() == "tool_use")
     {
-        messages.Add(response.AsRequestMessage());
-
-        var toolResults = new List<Block>();
-        foreach (var block in response.Content.Value2!)
+        messages.Add(new JsonObject
         {
-            if (!block.IsToolUse) continue;
-            var toolUse = block.ToolUse!;
+            ["role"] = "assistant",
+            ["content"] = response["content"]!.DeepClone(),
+        });
 
-            Console.WriteLine($"  [tool] {toolUse.Name}({toolUse.Input})");
-            var result = ExecuteTool(toolUse.Name, toolUse.Input?.ToString());
+        var toolResults = new JsonArray();
+        foreach (var block in response["content"]!.AsArray())
+        {
+            if (block?["type"]?.GetValue<string>() != "tool_use") continue;
+
+            var name = block["name"]!.GetValue<string>();
+            var id = block["id"]!.GetValue<string>();
+            var toolInput = block["input"]!;
+
+            Console.WriteLine($"  [tool] {name}({toolInput.ToJsonString()})");
+            var result = ExecuteTool(name, toolInput);
             Console.WriteLine($"  [result] {result}");
 
-            toolResults.Add(new ToolResultBlock
+            toolResults.Add(new JsonObject
             {
-                ToolUseId = toolUse.Id,
-                Content = result,
+                ["type"] = "tool_result",
+                ["tool_use_id"] = id,
+                ["content"] = result,
             });
         }
 
-        messages.Add(new Message { Role = MessageRole.User, Content = new(toolResults) });
-        try
-        {
-            response = await SendMessage(messages, systemPrompt, tools);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"\n[API error] {ExtractApiError(ex)}");
-            goto nextPrompt;
-        }
+        messages.Add(new JsonObject { ["role"] = "user", ["content"] = toolResults });
+
+        response = await SendAsync();
+        if (response is null) goto nextPrompt;
     }
 
-    messages.Add(response.AsRequestMessage());
+    messages.Add(new JsonObject
+    {
+        ["role"] = "assistant",
+        ["content"] = response["content"]!.DeepClone(),
+    });
 
-    var text = string.Join("", response.Content.Value2!
-        .Where(b => b.IsText)
-        .Select(b => b.Text!.Text));
+    var text = string.Concat(response["content"]!.AsArray()
+        .Where(b => b?["type"]?.GetValue<string>() == "text")
+        .Select(b => b!["text"]!.GetValue<string>()));
 
     Console.WriteLine($"\nClaude: {text}");
     nextPrompt:;
@@ -116,62 +125,51 @@ while (true)
 Console.WriteLine("\nGoodbye!");
 return 0;
 
-async Task<Message> SendMessage(List<Message> msgs, string system, List<Tool> t)
+async Task<JsonNode?> SendAsync()
 {
-    return await api.CreateMessageAsync(
-        new CreateMessageRequest
-        {
-            Model = "claude-haiku-4-5-20251001",
-            MaxTokens = 1024,
-            System = system,
-            Messages = msgs,
-            Tools = t,
-            ToolChoice = new ToolChoice { Type = ToolChoiceType.Auto },
-        });
-}
-
-static Tool CreateTool(string name, string description, object inputSchema)
-{
-    var schemaJson = JsonSerializer.Serialize(inputSchema);
-    var schema = JsonSerializer.Deserialize<ToolInputSchema>(schemaJson)
-                 ?? new ToolInputSchema();
-    return new Tool
+    var body = new JsonObject
     {
-        Name = name,
-        Description = description,
-        InputSchema = schema,
+        ["model"] = Model,
+        ["max_tokens"] = 1024,
+        ["system"] = SystemPrompt,
+        ["messages"] = messages.DeepClone(),
+        ["tools"] = tools.DeepClone(),
     };
-}
 
-static string ExecuteTool(string name, string? argsJson)
-{
-    var args = string.IsNullOrEmpty(argsJson)
-        ? new Dictionary<string, JsonElement>()
-        : JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(argsJson)
-          ?? new Dictionary<string, JsonElement>();
-
-    return name switch
-    {
-        "get_weather" => GetWeather(args.TryGetValue("location", out var loc) ? loc.GetString()! : "unknown"),
-        "calculate" => Calculate(args.TryGetValue("expression", out var expr) ? expr.GetString()! : "0"),
-        _ => $"Unknown tool: {name}",
-    };
-}
-
-static string ExtractApiError(Exception ex)
-{
-    var raw = ex.Message ?? "";
     try
     {
-        using var doc = JsonDocument.Parse(raw);
-        if (doc.RootElement.TryGetProperty("error", out var err) &&
-            err.TryGetProperty("message", out var msg))
+        using var resp = await http.PostAsJsonAsync("v1/messages", body);
+        var json = await resp.Content.ReadFromJsonAsync<JsonNode>();
+        if (!resp.IsSuccessStatusCode)
         {
-            return msg.GetString() ?? raw;
+            var msg = json?["error"]?["message"]?.GetValue<string>() ?? $"HTTP {(int)resp.StatusCode}";
+            Console.WriteLine($"\n[API error] {msg}");
+            return null;
         }
+        return json;
     }
-    catch (JsonException) { }
-    return raw;
+    catch (Exception ex)
+    {
+        Console.WriteLine($"\n[Network error] {ex.Message}");
+        return null;
+    }
+}
+
+static JsonObject Tool(string name, string description, JsonObject inputSchema) => new()
+{
+    ["name"] = name,
+    ["description"] = description,
+    ["input_schema"] = inputSchema,
+};
+
+static string ExecuteTool(string name, JsonNode input)
+{
+    return name switch
+    {
+        "get_weather" => GetWeather(input["location"]?.GetValue<string>() ?? "unknown"),
+        "calculate" => Calculate(input["expression"]?.GetValue<string>() ?? "0"),
+        _ => $"Unknown tool: {name}",
+    };
 }
 
 static string GetWeather(string location)
