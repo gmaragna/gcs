@@ -121,7 +121,7 @@ async Task<Message> SendMessage(List<Message> msgs, string system, List<Tool> t)
     return await api.CreateMessageAsync(
         new CreateMessageRequest
         {
-            Model = CreateMessageRequestModel.Claude35Sonnet20240620,
+            Model = "claude-haiku-4-5-20251001",
             MaxTokens = 1024,
             System = system,
             Messages = msgs,
