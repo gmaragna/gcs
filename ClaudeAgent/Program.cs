@@ -1,9 +1,16 @@
 using System.Text.Json;
 using Anthropic;
 
-var apiKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY")
-    ?? throw new InvalidOperationException(
-        "Set the ANTHROPIC_API_KEY environment variable before running.");
+var apiKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY");
+if (string.IsNullOrWhiteSpace(apiKey))
+{
+    Console.Error.WriteLine("ERROR: ANTHROPIC_API_KEY is not set.");
+    Console.Error.WriteLine();
+    Console.Error.WriteLine("Set it in PowerShell with:");
+    Console.Error.WriteLine("  $env:ANTHROPIC_API_KEY = \"sk-ant-...\"");
+    Console.Error.WriteLine("or add it to Properties/launchSettings.json so F5 picks it up.");
+    return 1;
+}
 
 using var api = new AnthropicApi(apiKey);
 
@@ -51,7 +58,17 @@ while (true)
 
     messages.Add(input.AsUserMessage());
 
-    var response = await SendMessage(messages, systemPrompt, tools);
+    Message response;
+    try
+    {
+        response = await SendMessage(messages, systemPrompt, tools);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"\n[API error] {ExtractApiError(ex)}");
+        messages.RemoveAt(messages.Count - 1);
+        continue;
+    }
 
     while (response.StopReason == StopReason.ToolUse)
     {
@@ -75,7 +92,15 @@ while (true)
         }
 
         messages.Add(new Message { Role = MessageRole.User, Content = new(toolResults) });
-        response = await SendMessage(messages, systemPrompt, tools);
+        try
+        {
+            response = await SendMessage(messages, systemPrompt, tools);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"\n[API error] {ExtractApiError(ex)}");
+            goto nextPrompt;
+        }
     }
 
     messages.Add(response.AsRequestMessage());
@@ -85,9 +110,11 @@ while (true)
         .Select(b => b.Text!.Text));
 
     Console.WriteLine($"\nClaude: {text}");
+    nextPrompt:;
 }
 
 Console.WriteLine("\nGoodbye!");
+return 0;
 
 async Task<Message> SendMessage(List<Message> msgs, string system, List<Tool> t)
 {
@@ -129,6 +156,22 @@ static string ExecuteTool(string name, string? argsJson)
         "calculate" => Calculate(args.TryGetValue("expression", out var expr) ? expr.GetString()! : "0"),
         _ => $"Unknown tool: {name}",
     };
+}
+
+static string ExtractApiError(Exception ex)
+{
+    var raw = ex.Message ?? "";
+    try
+    {
+        using var doc = JsonDocument.Parse(raw);
+        if (doc.RootElement.TryGetProperty("error", out var err) &&
+            err.TryGetProperty("message", out var msg))
+        {
+            return msg.GetString() ?? raw;
+        }
+    }
+    catch (JsonException) { }
+    return raw;
 }
 
 static string GetWeather(string location)
