@@ -3,7 +3,8 @@
     "ClaudeAgent": {
       "commandName": "Project",
       "environmentVariables": {
-        "ANTHROPIC_API_KEY": "REPLACE_WITH_YOUR_KEY"
+        "ANTHROPIC_API_KEY": "REPLACE_WITH_YOUR_KEY",
+        "NOTE_UPLOAD_ENDPOINT": "REPLACE_WITH_YOUR_UPLOAD_URL"
       }
     }
   }

@@ -17,11 +17,17 @@ if (string.IsNullOrWhiteSpace(apiKey))
 const string Model = "claude-haiku-4-5-20251001";
 const string SystemPrompt =
     "You are a helpful assistant. Use the available tools when the user asks about " +
-    "weather or math. Be concise in your answers.";
+    "weather, math, or wants to upload a note from this device. Be concise in your answers.";
+
+// Endpoint that notes are uploaded to. Must be configured by the user.
+var noteUploadEndpoint = Environment.GetEnvironmentVariable("NOTE_UPLOAD_ENDPOINT");
 
 using var http = new HttpClient { BaseAddress = new Uri("https://api.anthropic.com/") };
 http.DefaultRequestHeaders.Add("x-api-key", apiKey);
 http.DefaultRequestHeaders.Add("anthropic-version", "2023-06-01");
+
+// Separate client for uploading notes to the configured endpoint.
+using var uploadHttp = new HttpClient();
 
 var tools = new JsonArray
 {
@@ -53,12 +59,30 @@ var tools = new JsonArray
             },
             ["required"] = new JsonArray { "expression" },
         }),
+    Tool("upload_note", "Upload a note (text file) from this device to the configured upload endpoint.",
+        new JsonObject
+        {
+            ["type"] = "object",
+            ["properties"] = new JsonObject
+            {
+                ["path"] = new JsonObject
+                {
+                    ["type"] = "string",
+                    ["description"] = "Path to the note file on this device, e.g. '/home/user/notes/todo.txt'",
+                },
+            },
+            ["required"] = new JsonArray { "path" },
+        }),
 };
 
 var messages = new JsonArray();
 
 Console.WriteLine("Claude Agent (C#) — type 'exit' to quit.");
-Console.WriteLine("Available tools: get_weather, calculate");
+Console.WriteLine("Available tools: get_weather, calculate, upload_note");
+if (string.IsNullOrWhiteSpace(noteUploadEndpoint))
+    Console.WriteLine("Note: NOTE_UPLOAD_ENDPOINT is not set — upload_note will be unavailable until you configure it.");
+else
+    Console.WriteLine($"Notes will be uploaded to: {noteUploadEndpoint}");
 Console.WriteLine(new string('-', 50));
 
 while (true)
@@ -91,7 +115,7 @@ while (true)
             var toolInput = block["input"]!;
 
             Console.WriteLine($"  [tool] {name}({toolInput.ToJsonString()})");
-            var result = ExecuteTool(name, toolInput);
+            var result = await ExecuteTool(name, toolInput);
             Console.WriteLine($"  [result] {result}");
 
             toolResults.Add(new JsonObject
@@ -162,14 +186,59 @@ static JsonObject Tool(string name, string description, JsonObject inputSchema) 
     ["input_schema"] = inputSchema,
 };
 
-static string ExecuteTool(string name, JsonNode input)
+async Task<string> ExecuteTool(string name, JsonNode input)
 {
     return name switch
     {
         "get_weather" => GetWeather(input["location"]?.GetValue<string>() ?? "unknown"),
         "calculate" => Calculate(input["expression"]?.GetValue<string>() ?? "0"),
+        "upload_note" => await UploadNote(input["path"]?.GetValue<string>() ?? ""),
         _ => $"Unknown tool: {name}",
     };
+}
+
+async Task<string> UploadNote(string path)
+{
+    if (string.IsNullOrWhiteSpace(noteUploadEndpoint))
+        return "Error: NOTE_UPLOAD_ENDPOINT is not configured. Set it to the upload URL and restart.";
+    if (string.IsNullOrWhiteSpace(path))
+        return "Error: no note path provided.";
+    if (!File.Exists(path))
+        return $"Error: note file not found on this device: {path}";
+
+    string content;
+    try
+    {
+        content = await File.ReadAllTextAsync(path);
+    }
+    catch (Exception ex)
+    {
+        return $"Error reading note: {ex.Message}";
+    }
+
+    var payload = new JsonObject
+    {
+        ["name"] = Path.GetFileName(path),
+        ["content"] = content,
+    };
+
+    try
+    {
+        using var resp = await uploadHttp.PostAsJsonAsync(noteUploadEndpoint, payload);
+        if (!resp.IsSuccessStatusCode)
+            return $"Upload failed: HTTP {(int)resp.StatusCode} from {noteUploadEndpoint}";
+        return JsonSerializer.Serialize(new
+        {
+            uploaded = true,
+            note = Path.GetFileName(path),
+            bytes = content.Length,
+            endpoint = noteUploadEndpoint,
+        });
+    }
+    catch (Exception ex)
+    {
+        return $"Upload error: {ex.Message}";
+    }
 }
 
 static string GetWeather(string location)
