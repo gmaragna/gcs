@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
@@ -17,7 +18,9 @@ if (string.IsNullOrWhiteSpace(apiKey))
 const string Model = "claude-haiku-4-5-20251001";
 const string SystemPrompt =
     "You are a helpful assistant. Use the available tools when the user asks about " +
-    "weather, math, or wants to upload a note from this device. Be concise in your answers.";
+    "weather, math, or wants to list or upload notes from the Apple Notes app on this " +
+    "Mac (which syncs the user's iPhone notes via iCloud). When the user wants to upload " +
+    "a note but you don't know its exact title, call list_notes first. Be concise.";
 
 // Endpoint that notes are uploaded to. Must be configured by the user.
 var noteUploadEndpoint = Environment.GetEnvironmentVariable("NOTE_UPLOAD_ENDPOINT");
@@ -59,26 +62,34 @@ var tools = new JsonArray
             },
             ["required"] = new JsonArray { "expression" },
         }),
-    Tool("upload_note", "Upload a note (text file) from this device to the configured upload endpoint.",
+    Tool("list_notes", "List the titles of notes in the Apple Notes app on this Mac (synced from the user's iPhone via iCloud).",
+        new JsonObject
+        {
+            ["type"] = "object",
+            ["properties"] = new JsonObject(),
+        }),
+    Tool("upload_note", "Read a note from the Apple Notes app on this Mac (by its title) and upload it to the configured upload endpoint.",
         new JsonObject
         {
             ["type"] = "object",
             ["properties"] = new JsonObject
             {
-                ["path"] = new JsonObject
+                ["title"] = new JsonObject
                 {
                     ["type"] = "string",
-                    ["description"] = "Path to the note file on this device, e.g. '/home/user/notes/todo.txt'",
+                    ["description"] = "Exact title (name) of the note in Apple Notes, e.g. 'Shopping list'",
                 },
             },
-            ["required"] = new JsonArray { "path" },
+            ["required"] = new JsonArray { "title" },
         }),
 };
 
 var messages = new JsonArray();
 
 Console.WriteLine("Claude Agent (C#) — type 'exit' to quit.");
-Console.WriteLine("Available tools: get_weather, calculate, upload_note");
+Console.WriteLine("Available tools: get_weather, calculate, list_notes, upload_note");
+if (!OperatingSystem.IsMacOS())
+    Console.WriteLine("Note: list_notes/upload_note read Apple Notes via AppleScript and only work on macOS.");
 if (string.IsNullOrWhiteSpace(noteUploadEndpoint))
     Console.WriteLine("Note: NOTE_UPLOAD_ENDPOINT is not set — upload_note will be unavailable until you configure it.");
 else
@@ -192,33 +203,61 @@ async Task<string> ExecuteTool(string name, JsonNode input)
     {
         "get_weather" => GetWeather(input["location"]?.GetValue<string>() ?? "unknown"),
         "calculate" => Calculate(input["expression"]?.GetValue<string>() ?? "0"),
-        "upload_note" => await UploadNote(input["path"]?.GetValue<string>() ?? ""),
+        "list_notes" => ListNotes(),
+        "upload_note" => await UploadNote(input["title"]?.GetValue<string>() ?? ""),
         _ => $"Unknown tool: {name}",
     };
 }
 
-async Task<string> UploadNote(string path)
+// Reads the titles of all notes from the Apple Notes app via AppleScript.
+string ListNotes()
+{
+    const string script =
+        "tell application \"Notes\"\n" +
+        "    set out to \"\"\n" +
+        "    repeat with n in notes\n" +
+        "        set out to out & (name of n) & linefeed\n" +
+        "    end repeat\n" +
+        "    return out\n" +
+        "end tell";
+
+    var (ok, output, error) = RunOsascript(script);
+    if (!ok)
+        return $"Error listing notes: {error}";
+
+    var titles = output
+        .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .ToArray();
+    return JsonSerializer.Serialize(new { count = titles.Length, titles });
+}
+
+// Reads a note's plain text from Apple Notes (by title) and uploads it to the endpoint.
+async Task<string> UploadNote(string title)
 {
     if (string.IsNullOrWhiteSpace(noteUploadEndpoint))
         return "Error: NOTE_UPLOAD_ENDPOINT is not configured. Set it to the upload URL and restart.";
-    if (string.IsNullOrWhiteSpace(path))
-        return "Error: no note path provided.";
-    if (!File.Exists(path))
-        return $"Error: note file not found on this device: {path}";
+    if (string.IsNullOrWhiteSpace(title))
+        return "Error: no note title provided.";
 
-    string content;
-    try
-    {
-        content = await File.ReadAllTextAsync(path);
-    }
-    catch (Exception ex)
-    {
-        return $"Error reading note: {ex.Message}";
-    }
+    const string script =
+        "on run argv\n" +
+        "    set theTitle to item 1 of argv\n" +
+        "    tell application \"Notes\"\n" +
+        "        set matches to (notes whose name is theTitle)\n" +
+        "        if (count of matches) is 0 then return \"__NOT_FOUND__\"\n" +
+        "        return plaintext of item 1 of matches\n" +
+        "    end tell\n" +
+        "end run";
+
+    var (ok, content, error) = RunOsascript(script, title);
+    if (!ok)
+        return $"Error reading note from Apple Notes: {error}";
+    if (content.TrimEnd() == "__NOT_FOUND__")
+        return $"No note titled '{title}' found in Apple Notes. Use list_notes to see available titles.";
 
     var payload = new JsonObject
     {
-        ["name"] = Path.GetFileName(path),
+        ["title"] = title,
         ["content"] = content,
     };
 
@@ -230,7 +269,7 @@ async Task<string> UploadNote(string path)
         return JsonSerializer.Serialize(new
         {
             uploaded = true,
-            note = Path.GetFileName(path),
+            title,
             bytes = content.Length,
             endpoint = noteUploadEndpoint,
         });
@@ -238,6 +277,44 @@ async Task<string> UploadNote(string path)
     catch (Exception ex)
     {
         return $"Upload error: {ex.Message}";
+    }
+}
+
+// Runs an AppleScript via osascript, passing any extra args to the script's `on run argv`.
+static (bool ok, string output, string error) RunOsascript(string script, params string[] args)
+{
+    if (!OperatingSystem.IsMacOS())
+        return (false, "", "Apple Notes access requires macOS (osascript).");
+
+    var psi = new ProcessStartInfo
+    {
+        FileName = "osascript",
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        UseShellExecute = false,
+    };
+    psi.ArgumentList.Add("-e");
+    psi.ArgumentList.Add(script);
+    foreach (var arg in args)
+        psi.ArgumentList.Add(arg);
+
+    try
+    {
+        using var proc = Process.Start(psi);
+        if (proc is null)
+            return (false, "", "Failed to start osascript.");
+
+        var stdout = proc.StandardOutput.ReadToEnd();
+        var stderr = proc.StandardError.ReadToEnd();
+        proc.WaitForExit();
+
+        return proc.ExitCode == 0
+            ? (true, stdout, "")
+            : (false, stdout, string.IsNullOrWhiteSpace(stderr) ? $"osascript exited with {proc.ExitCode}" : stderr.Trim());
+    }
+    catch (Exception ex)
+    {
+        return (false, "", ex.Message);
     }
 }
 
